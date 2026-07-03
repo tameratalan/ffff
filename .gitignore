@@ -1,0 +1,12 @@
+venv/
+user_profiles/
+__pycache__/
+*.py[cod]
+*.log
+.env
+hesaplar.txt
+captcha_key.txt
+data/rank_latest.json
+_tmp_acc.txt
+.DS_Store
+Thumbs.db

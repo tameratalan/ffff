@@ -1,0 +1,10 @@
+# TrendyolHit — teknik ayarlar
+
+profile_1 = "film_hesap_1"
+profile_2 = "film_hesap_2"
+headless = true
+max_search_pages = 5
+accounts_file = "hesaplar.txt"
+
+account_1_action = "favorite"
+account_2_action = "cart"

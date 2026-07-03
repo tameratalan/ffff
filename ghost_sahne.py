@@ -4,9 +4,9 @@ TRENDYOL — Film Prop Demo
 Yakın çekim / terminal sahnesi için. Varsayılan: SIMÜLASYON (Trendyol'a bağlanmaz).
 
 Kullanım:
-    python ghost_trendyol.py              # Film modu — sahnedeki loglar
-    python ghost_trendyol.py --speed 2    # 2x hızlı (çekim için)
-    python ghost_trendyol.py --profiles 50 # Daha az profil (kısa sahne)
+    python ghost_sahne.py              # Film modu — sahnedeki loglar
+    python ghost_sahne.py --speed 2    # 2x hızlı (çekim için)
+    python ghost_sahne.py --profiles 50 # Daha az profil (kısa sahne)
 """
 
 from __future__ import annotations

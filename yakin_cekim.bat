@@ -7,5 +7,5 @@ color 0A
 mode con: cols=95 lines=40
 
 if exist "venv\Scripts\activate.bat" call venv\Scripts\activate.bat
-python ghost_trendyol.py --profiles 2 --sessions 20 --speed 1.2 --no-code
+python ghost_sahne.py --profiles 2 --sessions 20 --speed 1.2 --no-code
 pause

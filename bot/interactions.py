@@ -4,11 +4,43 @@ import random
 
 from playwright.async_api import Page
 
-from bot.human import human_click, human_delay, scroll_to_element, smooth_scroll
+from bot.human import human_click, human_delay, quick_click, scroll_to_element, smooth_scroll
+from bot.navigation import dismiss_overlays
 from bot.qa import ask_product_question
 from bot.selectors import SELECTORS
 from config import FeatureFlags
 from core.log_bus import LOG_BUS
+
+
+async def _favorite_is_active(page: Page) -> bool:
+    fav = page.locator("[data-testid='favorite-toggle']").first
+    try:
+        if await fav.count() == 0:
+            return False
+        cls = await fav.evaluate(
+            "el => (el.querySelector('i')?.className || '') + ' ' + (el.getAttribute('aria-pressed') || '')",
+            timeout=2000,
+        )
+        low = cls.lower()
+        return (
+            "heart-filled" in low
+            or "i-heart-fill" in low
+            or "aria-pressed=true" in low.replace(" ", "")
+            or "_red_" in low
+        )
+    except Exception:
+        return False
+
+
+async def _cart_button_state(page: Page) -> str:
+    for sel in SELECTORS["add_to_cart"].split(", "):
+        loc = page.locator(sel.strip()).first
+        try:
+            if await loc.count() > 0 and await loc.is_visible(timeout=1500):
+                return (await loc.inner_text(timeout=2000)).strip()
+        except Exception:
+            continue
+    return ""
 
 
 async def view_product_page(page: Page, bot_id: int, speed: float, *, scroll_bursts: int) -> None:
@@ -67,55 +99,119 @@ async def like_review(page: Page, bot_id: int, speed: float) -> None:
         pass
 
 
-async def add_favorite(page: Page, bot_id: int, speed: float) -> bool:
-    LOG_BUS.emit("INFO", bot_id, "❤️ Favoriye ekleniyor...")
+async def add_favorite(page: Page, bot_id: int, speed: float, *, turbo: bool = False) -> bool:
+    LOG_BUS.emit("INFO", bot_id, "Favoriye ekleniyor...")
+    await dismiss_overlays(page, bot_id)
 
-    # Zaten favoride mi?
-    for sel in SELECTORS["favorite_active"].split(", "):
-        try:
-            active = page.locator(sel.strip()).first
-            if await active.is_visible(timeout=1500):
-                LOG_BUS.emit("INFO", bot_id, "Zaten favorilerde.")
-                return True
-        except Exception:
-            pass
+    if await _favorite_is_active(page):
+        LOG_BUS.emit("INFO", bot_id, "Zaten favorilerde.")
+        return True
 
-    # Sırayla dene
-    for sel in SELECTORS["favorite_btn"].split(", "):
-        sel = sel.strip()
-        if await human_click(page, sel, bot_id):
-            await human_delay(bot_id, 0.8, 1.5, speed=speed)
-            # Doğrula
-            for active_sel in SELECTORS["favorite_active"].split(", "):
-                try:
-                    if await page.locator(active_sel.strip()).first.is_visible(timeout=2000):
-                        LOG_BUS.emit("SUCCESS", bot_id, "❤️ Favoriye eklendi!")
-                        return True
-                except Exception:
-                    pass
-            LOG_BUS.emit("SUCCESS", bot_id, "❤️ Favori butonuna tıklandı.")
+    fav = page.locator("[data-testid='favorite-toggle']").first
+    try:
+        await fav.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+
+    clicked = False
+    try:
+        async with page.expect_response(
+            lambda r: "add-to-favorites" in r.url and r.status == 200,
+            timeout=8_000,
+        ):
+            for sel in SELECTORS["favorite_btn"].split(", "):
+                sel = sel.strip()
+                if turbo:
+                    ok = await quick_click(page, sel, bot_id, timeout=4_000, force=True)
+                else:
+                    ok = await human_click(page, sel, bot_id)
+                if ok:
+                    clicked = True
+                    break
+            if not clicked:
+                return False
+        LOG_BUS.emit("SUCCESS", bot_id, "Favoriye eklendi (dogrulandi).")
+        return True
+    except Exception:
+        clicked = False
+        for sel in SELECTORS["favorite_btn"].split(", "):
+            sel = sel.strip()
+            if turbo:
+                ok = await quick_click(page, sel, bot_id, timeout=4_000, force=True)
+            else:
+                ok = await human_click(page, sel, bot_id)
+            if ok:
+                clicked = True
+                break
+
+    if not clicked:
+        LOG_BUS.emit("WARNING", bot_id, "Favori butonu bulunamadi.")
+        return False
+
+    await page.wait_for_timeout(1500)
+
+    if await _favorite_is_active(page):
+        LOG_BUS.emit("SUCCESS", bot_id, "Favoriye eklendi (dogrulandi).")
+        return True
+
+    try:
+        fav = page.locator("[data-testid='favorite-toggle']").first
+        cls = await fav.evaluate("el => el.querySelector('i')?.className || ''", timeout=2000)
+        if "heart" in cls.lower() and "_black_" not in cls:
+            LOG_BUS.emit("SUCCESS", bot_id, "Favoriye eklendi (ikon degisti).")
             return True
+    except Exception:
+        pass
 
-    LOG_BUS.emit("WARNING", bot_id, "Favori butonu bulunamadı.")
+    LOG_BUS.emit("WARNING", bot_id, "Favori islemi tamamlanamadi — cookie/popup veya gecersiz urun linki olabilir.")
     return False
 
 
-async def add_to_cart(page: Page, bot_id: int, speed: float) -> bool:
-    LOG_BUS.emit("INFO", bot_id, "🛒 Sepete ekleme deneniyor...")
+async def add_to_cart(page: Page, bot_id: int, speed: float, *, turbo: bool = False) -> bool:
+    LOG_BUS.emit("INFO", bot_id, "Sepete ekleme deneniyor...")
+    await dismiss_overlays(page, bot_id)
+
+    state = await _cart_button_state(page)
+    if "tükendi" in state.lower() or "tukendi" in state.lower():
+        LOG_BUS.emit("WARNING", bot_id, "Urun tukendi — sepete eklenemez.")
+        return False
+    if "eklendi" in state.lower():
+        LOG_BUS.emit("INFO", bot_id, "Zaten sepette.")
+        return True
+
     sizes = page.locator(SELECTORS["size_option"])
     try:
         if await sizes.count() > 0:
             idx = random.randint(0, min(await sizes.count(), 5) - 1)
-            await sizes.nth(idx).click()
-            LOG_BUS.emit("INFO", bot_id, "📏 Beden seçildi.")
-            await human_delay(bot_id, 0.8, 1.5, speed=speed)
+            await sizes.nth(idx).click(timeout=3_000, force=True)
+            if not turbo:
+                await human_delay(bot_id, 0.8, 1.5, speed=speed)
     except Exception:
         pass
 
-    ok = await human_click(page, SELECTORS["add_to_cart"], bot_id)
-    if ok:
-        LOG_BUS.emit("SUCCESS", bot_id, "🛒 Sepete Ekle butonuna basıldı!")
-    return ok
+    clicked = False
+    for sel in SELECTORS["add_to_cart"].split(", "):
+        sel = sel.strip()
+        if turbo:
+            ok = await quick_click(page, sel, bot_id, timeout=4_000, force=True)
+        else:
+            ok = await human_click(page, sel, bot_id)
+        if ok:
+            clicked = True
+            break
+
+    if not clicked:
+        LOG_BUS.emit("WARNING", bot_id, "Sepete Ekle butonu bulunamadi.")
+        return False
+
+    await page.wait_for_timeout(2500 if turbo else 1500)
+    after = await _cart_button_state(page)
+    if "eklendi" in after.lower():
+        LOG_BUS.emit("SUCCESS", bot_id, "Sepete eklendi (dogrulandi).")
+        return True
+
+    LOG_BUS.emit("WARNING", bot_id, "Sepet butonuna tiklandi ama 'Sepete Eklendi' gorulmedi.")
+    return False
 
 
 async def browse_store(page: Page, bot_id: int, speed: float) -> None:
@@ -135,15 +231,55 @@ async def browse_store(page: Page, bot_id: int, speed: float) -> None:
         LOG_BUS.emit("WARNING", bot_id, f"Mağaza gezintisi atlandı: {exc}")
 
 
-async def follow_store(page: Page, bot_id: int, speed: float) -> None:
-    btn = page.locator(SELECTORS["seller_follow"]).first
-    try:
-        if await btn.is_visible(timeout=3000):
-            await btn.click()
-            LOG_BUS.emit("SUCCESS", bot_id, "➕ Mağaza takip edildi.")
-            await human_delay(bot_id, 1, 2, speed=speed)
-    except Exception:
-        pass
+async def follow_store(page: Page, bot_id: int, speed: float, *, turbo: bool = False) -> bool:
+    LOG_BUS.emit("INFO", bot_id, "Magaza takip ediliyor...")
+    await dismiss_overlays(page, bot_id)
+
+    async def _is_following() -> bool:
+        try:
+            body = (await page.inner_text("body", timeout=4000)).lower()
+        except Exception:
+            body = ""
+        return (
+            "takip ediliyor" in body
+            or "takibi bırak" in body
+            or "takibi birak" in body
+        )
+
+    if await _is_following():
+        LOG_BUS.emit("INFO", bot_id, "Magaza zaten takip ediliyor.")
+        return True
+
+    for sel in SELECTORS["seller_follow"].split(", "):
+        sel = sel.strip()
+        try:
+            async with page.expect_response(
+                lambda r: "/api/follow/" in r.url and 200 <= r.status < 300,
+                timeout=8000,
+            ):
+                ok = (
+                    await quick_click(page, sel, bot_id, timeout=5000, force=True)
+                    if turbo
+                    else await human_click(page, sel, bot_id)
+                )
+                if not ok:
+                    continue
+            await page.wait_for_timeout(1500 if turbo else 1000)
+            if await _is_following():
+                LOG_BUS.emit("SUCCESS", bot_id, "Magaza takip edildi (API + buton dogrulandi).")
+                return True
+            LOG_BUS.emit("SUCCESS", bot_id, "Magaza takip edildi (API dogrulandi).")
+            return True
+        except Exception:
+            # Selector yanlis olabilir veya hesap zaten takipte olabilir; siradaki
+            # selectoru denemeden once sayfa durumuna tekrar bak.
+            if await _is_following():
+                LOG_BUS.emit("SUCCESS", bot_id, "Magaza takip edildi (buton dogrulandi).")
+                return True
+            continue
+
+    LOG_BUS.emit("WARNING", bot_id, "Magaza takip butonu bulunamadi.")
+    return False
 
 
 async def collect_coupon(page: Page, bot_id: int, speed: float) -> None:

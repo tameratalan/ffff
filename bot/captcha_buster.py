@@ -6,7 +6,7 @@ import asyncio
 
 from playwright.async_api import Page
 
-from bot.captcha_detect import captcha_token_present, captcha_visible
+from bot.captcha_detect import captcha_solved, captcha_visible
 from config import BUSTER_EXTENSION_DIR
 from core.log_bus import LOG_BUS
 
@@ -73,7 +73,7 @@ async def try_buster_solve(page: Page, bot_id: int, *, wait_sec: int = 45) -> bo
     await _click_recaptcha_checkbox(page)
     await asyncio.sleep(1.5)
 
-    if await captcha_token_present(page):
+    if await captcha_solved(page):
         LOG_BUS.emit("SUCCESS", bot_id, "reCAPTCHA gecti (tek tik)")
         return True
 
@@ -87,7 +87,7 @@ async def try_buster_solve(page: Page, bot_id: int, *, wait_sec: int = 45) -> bo
 
     elapsed = 0
     while elapsed < wait_sec:
-        if await captcha_token_present(page):
+        if await captcha_solved(page):
             LOG_BUS.emit("SUCCESS", bot_id, "Buster ile cozuldu (ucretsiz)")
             return True
         if not await captcha_visible(page):
@@ -97,4 +97,4 @@ async def try_buster_solve(page: Page, bot_id: int, *, wait_sec: int = 45) -> bo
         if elapsed in (10, 20, 30):
             await _click_buster_button(page)
 
-    return await captcha_token_present(page)
+    return await captcha_solved(page)

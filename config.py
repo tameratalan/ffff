@@ -57,7 +57,46 @@ def _load_captcha_key() -> str:
 
 
 CAPTCHA_API_KEY = _load_captcha_key()
-CAPTCHA_SERVICE = os.environ.get("CAPTCHA_SERVICE", "2captcha").strip().lower()
+
+
+# reCAPTCHA otomatik cozum — https://capsolver.com API key (2captcha'dan daha hizli)
+def _load_capsolver_key() -> str:
+    env = (
+        os.environ.get("CAPSOLVER_API_KEY", "").strip()
+        or os.environ.get("CAPTCHA_CAPSOLVER_KEY", "").strip()
+    )
+    if env:
+        return env
+    key_file = BASE_DIR / "capsolver_key.txt"
+    if key_file.exists():
+        for ln in key_file.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                return ln
+    return ""
+
+
+CAPSOLVER_API_KEY = _load_capsolver_key()
+
+# "capsolver" | "2captcha" | "auto" (bos = auto): auto/bos ise CAPSOLVER_API_KEY
+# doluysa CapSolver birincil servis olarak secilir (2captcha'dan daha hizli).
+CAPTCHA_SERVICE = os.environ.get("CAPTCHA_SERVICE", "auto").strip().lower()
+
+
+def _load_tempmail_key() -> str:
+    env = os.environ.get("TEMPMAIL_API_KEY", "").strip()
+    if env:
+        return env
+    key_file = BASE_DIR / "tempmail_key.txt"
+    if key_file.exists():
+        for ln in key_file.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                return ln
+    return ""
+
+
+TEMPMAIL_API_KEY = _load_tempmail_key()
 
 # Buster — ucretsiz reCAPTCHA extension (setup_buster.bat ile kurulur)
 BUSTER_EXTENSION_DIR = Path(

@@ -16,14 +16,22 @@ _FOOTER_SKIP = re.compile(r"sıkça|sikca|sss|yardım|yardim|destek", re.I)
 _QA_TAB = re.compile(r"(\d+\s*)?soru.?cevap|satıcı soruları|satici sorulari", re.I)
 _ASK_BTN = re.compile(r"^soru\s*sor$|satıcıya\s*sor|saticiya\s*sor|yeni\s*soru", re.I)
 _SUBMIT_BTN = re.compile(r"^gönder$|^gonder$|^sor$", re.I)
+# Soru-Cevap sekmesindeki "sorularda ara" arama kutusu placeholder'inda
+# "soru" gectigi icin yanlislikla soru yazma alani sanilabiliyor — bunu
+# her zaman reddet, "soru" icerse bile.
+_SEARCH_FIELD = re.compile(r"\bara\b|arayın|arayin|search|filtrele", re.I)
+# Soru metninin altindaki "ad soyad gosterme" tercihi — kisisel bir ayar,
+# kullanici ozel talep etmedikce dokunulmaz (varsayilan durumu korunur).
+_NAME_DISPLAY_CHECKBOX = re.compile(r"ad\s*soyad|isim\s*soyisim|isim\s*soyad", re.I)
 
 _FIND_FIELD_JS = """
 () => {
   const bad = (s) => {
     const x = (s || '').toLowerCase();
-    return x.includes('vendor') || x.includes('suggestion') ||
-      x.includes('satıcıları') || x.includes('saticilari') ||
-      (x.includes('ara') && !x.includes('soru'));
+    if (x.includes('vendor') || x.includes('suggestion')) return true;
+    if (x.includes('satıcıları') || x.includes('saticilari')) return true;
+    if (/\bara\b|arayın|arayin|search|filtrele/.test(x)) return true;
+    return false;
   };
   const pick = (el) => {
     const ph = el.getAttribute('placeholder') || '';
@@ -55,6 +63,46 @@ _FIND_FIELD_JS = """
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.length ? scored[0].el : null;
+}
+"""
+
+_FIND_CHECKBOXES_JS = """
+(field) => {
+  let container = field;
+  for (let i = 0; i < 12 && container; i++) {
+    if (container.querySelectorAll && container.querySelectorAll("input[type='checkbox']").length > 0) {
+      break;
+    }
+    container = container.parentElement;
+  }
+  if (!container) container = document.body;
+  const boxes = Array.from(container.querySelectorAll("input[type='checkbox']"));
+  return boxes.map((cb) => {
+    let label = '';
+    if (cb.id) {
+      const lbl = document.querySelector(`label[for='${cb.id}']`);
+      if (lbl) label = lbl.innerText.trim();
+    }
+    if (!label && cb.closest('label')) label = cb.closest('label').innerText.trim();
+    return { id: cb.id || '', checked: cb.checked, label: label.slice(0, 200) };
+  });
+}
+"""
+
+_SUBMIT_DISABLED_JS = """
+() => {
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden';
+  };
+  const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+  const btn = btns.find((b) => {
+    const t = (b.innerText || '').trim().toLowerCase();
+    return (t === 'gönder' || t === 'gonder' || t === 'sor') && isVisible(b);
+  });
+  return btn ? !!btn.disabled : null;
 }
 """
 
@@ -167,9 +215,15 @@ async def _find_field_locator(page: Page, bot_id: int, *, long_wait: bool = Fals
         for ph_re in placeholders:
             loc = page.get_by_placeholder(ph_re)
             try:
-                if await loc.count() > 0 and await loc.first.is_visible(timeout=400):
+                for i in range(await loc.count()):
+                    field = loc.nth(i)
+                    if not await field.is_visible(timeout=400):
+                        continue
+                    ph = (await field.get_attribute("placeholder") or "")
+                    if _SEARCH_FIELD.search(ph):
+                        continue
                     LOG_BUS.emit("INFO", bot_id, "Yazma alani (placeholder)")
-                    return loc.first
+                    return field
             except Exception:
                 pass
 
@@ -185,7 +239,7 @@ async def _find_field_locator(page: Page, bot_id: int, *, long_wait: bool = Fals
                     if not await field.is_visible(timeout=300):
                         continue
                     ph = (await field.get_attribute("placeholder") or "").lower()
-                    if "ara" in ph and "soru" not in ph:
+                    if _SEARCH_FIELD.search(ph):
                         continue
                     if "vendor" in ph or "satici" in ph:
                         continue
@@ -238,6 +292,111 @@ async def _write_question(page: Page, field, text: str, bot_id: int) -> bool:
     except Exception as exc:
         LOG_BUS.emit("WARNING", bot_id, f"Yazma hatasi: {exc}")
         return False
+
+
+async def _set_checkbox(page: Page, cb_id: str, checked: bool, bot_id: int) -> bool:
+    """Onay kutusunu istenen duruma (isaretli/isaretsiz) getir.
+
+    Native input genelde gorsel olarak gizlenmis (0x0) oluyor; gercek
+    kutucuk CSS ile label'a bagli render ediliyor. Label'in TAM ortasina
+    tiklamak yerine sol ust kosesine (gorsel kutunun oldugu yer) tikliyoruz,
+    cunku label metninde ic-ice link olabiliyor (orn. "Kullanici Sozlesmesi"
+    linki) ve ortasina tiklamak o linki acabiliyor.
+    """
+    if cb_id:
+        try:
+            label = page.locator(f"label[for='{cb_id}']")
+            if await label.count() > 0:
+                await label.first.click(timeout=3000, position={"x": 9, "y": 9})
+                if await page.locator(f"#{cb_id}").is_checked() == checked:
+                    return True
+        except Exception:
+            pass
+
+    try:
+        await page.evaluate(
+            """([id, checked]) => {
+                const cb = document.getElementById(id);
+                if (!cb || cb.checked === checked) return;
+                cb.checked = checked;
+                cb.dispatchEvent(new Event('input', { bubbles: true }));
+                cb.dispatchEvent(new Event('change', { bubbles: true }));
+                cb.dispatchEvent(new Event('click', { bubbles: true }));
+            }""",
+            [cb_id, checked],
+        )
+        return True
+    except Exception as exc:
+        LOG_BUS.emit("WARNING", bot_id, f"Onay kutusu durumu degistirilemedi: {exc}")
+        return False
+
+
+async def _handle_consent_checkboxes(page: Page, field, bot_id: int) -> None:
+    """Soru metninin ALTINDAKI onay kutularini ele al.
+
+    - "Ad soyad gosterme" tercihi: kullanici adinin/soyadinin sorularda
+      gizli kalmasini istiyor — isaretliyse KALDIRILIR (uncheck). Zaten
+      isaretsizse dokunulmaz.
+    - Gonder butonunu pasif tutan (zorunlu onay/sozlesme gibi) kutucuklar
+      tespit edilip SADECE onlar isaretlenir.
+    """
+    try:
+        boxes = await field.evaluate(_FIND_CHECKBOXES_JS)
+    except Exception:
+        boxes = []
+
+    if not boxes:
+        return
+
+    LOG_BUS.emit("INFO", bot_id, f"Soru formunda {len(boxes)} onay kutusu bulundu")
+
+    for box in boxes:
+        label = (box.get("label") or "").strip()
+        if not _NAME_DISPLAY_CHECKBOX.search(label):
+            continue
+
+        if not box.get("checked"):
+            LOG_BUS.emit("INFO", bot_id, "Isim/soyad gosterme tercihi zaten isaretsiz (gizli)")
+            continue
+
+        if await _set_checkbox(page, box.get("id") or "", False, bot_id):
+            box["checked"] = False
+            LOG_BUS.emit(
+                "INFO", bot_id, f"Isim/soyad gosterme tercihi kaldirildi (gizlendi): {label[:70]}"
+            )
+            await human_delay(bot_id, 0.2, 0.5, speed=1.0)
+        else:
+            LOG_BUS.emit("WARNING", bot_id, f"Isim/soyad tercihi kaldirilamadi: {label[:70]}")
+
+    try:
+        disabled = await page.evaluate(_SUBMIT_DISABLED_JS)
+    except Exception:
+        disabled = None
+
+    if disabled is False:
+        return
+
+    for box in boxes:
+        label = (box.get("label") or "").strip()
+        if box.get("checked") or _NAME_DISPLAY_CHECKBOX.search(label):
+            continue
+
+        try:
+            still_disabled = await page.evaluate(_SUBMIT_DISABLED_JS)
+        except Exception:
+            still_disabled = None
+        if still_disabled is False:
+            break
+
+        if await _set_checkbox(page, box.get("id") or "", True, bot_id):
+            LOG_BUS.emit(
+                "INFO", bot_id, f"Zorunlu onay kutusu isaretlendi: {label[:70] or 'isimsiz'}"
+            )
+            await human_delay(bot_id, 0.2, 0.5, speed=1.0)
+        else:
+            LOG_BUS.emit(
+                "WARNING", bot_id, f"Onay kutusu isaretlenemedi: {label[:70] or 'isimsiz'}"
+            )
 
 
 async def _submit_question(page: Page, bot_id: int, speed: float) -> bool:
@@ -294,14 +453,16 @@ async def ask_product_question(
         LOG_BUS.emit("WARNING", bot_id, "Soru-Cevap sekmesi bulunamadi")
         return False
 
-    field = await _find_field_locator(page, bot_id)
-    if field is None:
-        if not await _click_ask_button(page, bot_id):
-            LOG_BUS.emit("WARNING", bot_id, "'Soru Sor' butonu bulunamadi")
-            return False
-        await dismiss_overlays(page, bot_id)
-        await asyncio.sleep(1.0)
-        field = await _find_field_locator(page, bot_id, long_wait=True)
+    # Her zaman once "Soru Sor" / "Saticiya Sor" butonuna tikla — aksi halde
+    # sekmedeki "sorularda ara" arama kutusu yanlislikla soru yazma alani
+    # sanilabiliyor.
+    if not await _click_ask_button(page, bot_id):
+        LOG_BUS.emit("WARNING", bot_id, "'Soru Sor' butonu bulunamadi")
+        return False
+
+    await dismiss_overlays(page, bot_id)
+    await asyncio.sleep(1.0)
+    field = await _find_field_locator(page, bot_id, long_wait=True)
 
     if field is None:
         LOG_BUS.emit("WARNING", bot_id, "Soru yazma alani acilmadi")
@@ -313,6 +474,8 @@ async def ask_product_question(
 
     LOG_BUS.emit("INFO", bot_id, "Soru metni yazildi")
     await human_delay(bot_id, 0.6, 1.2, speed=speed)
+
+    await _handle_consent_checkboxes(page, field, bot_id)
 
     if await _submit_question(page, bot_id, speed):
         LOG_BUS.emit("SUCCESS", bot_id, "Soru gonderildi")

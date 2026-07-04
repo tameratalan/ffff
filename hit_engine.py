@@ -11,25 +11,16 @@ from pathlib import Path
 
 from playwright.async_api import Playwright, async_playwright
 
-from bot.interactions import add_favorite, add_to_cart, ask_question_with_account, view_product_page
-from bot.login import ensure_logged_in, trendyol_login
-from bot.navigation import dismiss_overlays, find_product_organically, goto_home, goto_product_direct
+from bot.interactions import view_product_page
+from bot.login import login_with_token, is_logged_in
+from bot.navigation import dismiss_overlays, find_product_organically, goto_home
 from bot.stealth import launch_persistent_context
 from config import PROFILES_DIR
 from core.async_utils import interruptible_sleep, should_stop
 from core.log_bus import LOG_BUS
 from core.parser import ParsedTarget, parse_target
 from core.state import STATE
-from rank_checker import resolve_product_ids
-
-
-@dataclass
-class HitModules:
-    hit: bool = True
-    favorite: bool = False
-    cart: bool = False
-    question: bool = False
-    question_text: str = "Urun orijinal mi?"
+from rank_checker import resolve_product_ids, scan_rank
 
 
 @dataclass
@@ -39,20 +30,21 @@ class HitJob:
     max_pages: int = 50
     headless: bool = True
     guest_mode: bool = True
-    accounts: list[tuple[str, str]] = field(default_factory=list)
-    modules: HitModules = field(default_factory=HitModules)
+    accounts: list[tuple[str, str, str | None]] = field(default_factory=list)
     delay_between: float = 1.0
-    entry_mode: str = "organic"  # organic | direct
     parallel: int = 10
     total_hits: int = 50  # 0 = DURDUR'a kadar sonsuz dalga
     product_ids: list[str] = field(default_factory=list)
     split_by_keyword: bool = False  # toplam hit'i kelimelere esit bol
+    session_timeout: float = 120.0  # tek oturum max saniye
+    rank_check_pages: int = 25  # hit oncesi sira taramasi max sayfa
 
 
 class HitEngine:
     def __init__(self) -> None:
         self.stats: dict[str, int] = {"ok": 0, "fail": 0, "total": 0, "waves": 0}
         self.keyword_stats: dict[str, dict[str, int]] = {}
+        self._excluded_keywords: set[str] = set()
 
     def stop(self) -> None:
         STATE.request_stop()
@@ -62,6 +54,44 @@ class HitEngine:
         STATE.reset_stop()
         self.stats = {"ok": 0, "fail": 0, "total": 0, "waves": 0}
         self.keyword_stats = {}
+        self._excluded_keywords = set()
+
+    def _active_keywords(self, keywords: list[str]) -> list[str]:
+        return [k for k in keywords if k not in self._excluded_keywords]
+
+    async def _filter_ranked_keywords(self, job: HitJob, keywords: list[str]) -> list[str]:
+        """Organik hit oncesi: sadece siralamada bulunan kelimeleri birak."""
+        ranked: list[str] = []
+        check_pages = max(1, min(job.max_pages, job.rank_check_pages))
+        LOG_BUS.emit(
+            "INFO",
+            0,
+            f"Siralama on kontrolu ({len(keywords)} kelime, max {check_pages} sayfa)...",
+        )
+        for kw in keywords:
+            if should_stop():
+                break
+            result = await scan_rank(
+                job.product_url,
+                kw,
+                max_pages=check_pages,
+                headless=job.headless,
+            )
+            if result.found:
+                ranked.append(kw)
+                LOG_BUS.emit(
+                    "SUCCESS",
+                    0,
+                    f'Hit icin uygun: "{kw}" (sayfa {result.page}, sira ~{result.estimated_rank})',
+                )
+            else:
+                self._excluded_keywords.add(kw)
+                LOG_BUS.emit(
+                    "WARNING",
+                    0,
+                    f'Atlandi — siralamada yok: "{kw}" ({result.pages_scanned} sayfa tarandi)',
+                )
+        return ranked
 
     def _init_keyword_stats(self, keywords: list[str]) -> None:
         self.keyword_stats = {kw: {"ok": 0, "fail": 0} for kw in keywords}
@@ -75,19 +105,22 @@ class HitEngine:
             self.keyword_stats[keyword]["fail"] += 1
 
     def _keyword_for_session(self, job: HitJob, keywords: list[str], index: int) -> str:
-        if len(keywords) == 1:
-            return keywords[0]
+        active = self._active_keywords(keywords)
+        if not active:
+            return keywords[0] if keywords else ""
+        if len(active) == 1:
+            return active[0]
         if not job.split_by_keyword or job.total_hits <= 0:
-            return keywords[index % len(keywords)]
-        per_kw = max(1, job.total_hits // len(keywords))
-        extra = job.total_hits % len(keywords)
+            return active[index % len(active)]
+        per_kw = max(1, job.total_hits // len(active))
+        extra = job.total_hits % len(active)
         slots: list[str] = []
-        for i, kw in enumerate(keywords):
+        for i, kw in enumerate(active):
             n = per_kw + (1 if i < extra else 0)
             slots.extend([kw] * n)
         if index < len(slots):
             return slots[index]
-        return keywords[index % len(keywords)]
+        return active[index % len(active)]
 
     def _profile_name(self, index: int, guest: bool, email: str | None = None) -> str:
         if guest:
@@ -105,6 +138,7 @@ class HitEngine:
         session_index: int,
         email: str | None,
         password: str | None,
+        token: str | None = None,
     ) -> bool:
         if should_stop():
             return False
@@ -113,6 +147,8 @@ class HitEngine:
         target = parse_target(job.product_url, default_keyword=keyword)
         profile = self._profile_name(session_index, job.guest_mode, email)
         prof_path = str((PROFILES_DIR / profile).resolve())
+        speed = 2.5 if job.headless else 1.0
+        scroll_bursts = 2 if job.headless else 4
 
         pid = target.product_id or "?"
         LOG_BUS.emit(
@@ -124,98 +160,71 @@ class HitEngine:
 
         ctx, _device = await launch_persistent_context(
             pw, prof_path, headless=job.headless, bot_id=bot_id,
-            desktop_only=job.entry_mode == "direct",
+            desktop_only=False,
             enable_buster=not job.headless,
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         try:
-            if not job.guest_mode and email and password:
-                if not await trendyol_login(page, email, password, bot_id):
-                    LOG_BUS.emit("ERROR", bot_id, "Giris basarisiz")
+            if not job.guest_mode and email:
+                if not (token or "").strip():
+                    LOG_BUS.emit("ERROR", bot_id, "Token yok — misafir modu kapali ve token gerekli")
+                    return False
+                if not await login_with_token(page, token, email, bot_id, speed=speed):
+                    LOG_BUS.emit("ERROR", bot_id, "Token ile giris basarisiz")
+                    return False
+                if not await is_logged_in(page):
+                    LOG_BUS.emit("ERROR", bot_id, "Oturum acilamadi")
                     return False
             else:
-                await goto_home(page, bot_id, speed=1.0)
+                await goto_home(page, bot_id, speed=speed)
 
-            if job.modules.question and email and password:
-                if not await ensure_logged_in(page, email, password, bot_id):
-                    LOG_BUS.emit("ERROR", bot_id, "Soru icin giris gerekli — oturum acilamadi")
-                    return False
-
-            if job.entry_mode == "direct":
-                url = target.product_url or job.product_url
-                if not url:
-                    LOG_BUS.emit("ERROR", bot_id, "Urun linki yok")
-                    return False
-                LOG_BUS.emit("INFO", bot_id, f"Dogrudan hedef urun (-p-{pid})")
-                found = await goto_product_direct(page, bot_id, url, speed=1.0)
-                if found and job.modules.question:
-                    await asyncio.sleep(1.5)
-                    await page.evaluate("window.scrollBy(0, 400)")
-            else:
-                if not target.product_id:
-                    LOG_BUS.emit("ERROR", bot_id, "Hedef urun ID yok — baska urune tiklanmaz, iptal")
-                    return False
-                search_target = ParsedTarget(
-                    raw=target.raw,
-                    product_id=target.product_id,
-                    product_url=target.product_url,
-                    search_keyword=keyword,
-                )
-                ids = job.product_ids or ([target.product_id] if target.product_id else [])
-                LOG_BUS.emit(
-                    "INFO",
-                    bot_id,
-                    f"Hedef p-{ids[0]} araniyor (max {job.max_pages} sayfa)",
-                )
-                found = await find_product_organically(
-                    page, bot_id, search_target, max_pages=job.max_pages, speed=1.0,
-                    product_ids=ids,
-                )
+            if not target.product_id:
+                LOG_BUS.emit("ERROR", bot_id, "Hedef urun ID yok — baska urune tiklanmaz, iptal")
+                return False
+            search_target = ParsedTarget(
+                raw=target.raw,
+                product_id=target.product_id,
+                product_url=target.product_url,
+                search_keyword=keyword,
+            )
+            ids = job.product_ids or ([target.product_id] if target.product_id else [])
+            LOG_BUS.emit(
+                "INFO",
+                bot_id,
+                f"Hedef p-{ids[0]} araniyor (max {job.max_pages} sayfa)",
+            )
+            found = await find_product_organically(
+                page, bot_id, search_target, max_pages=job.max_pages, speed=speed,
+                product_ids=ids,
+            )
 
             if should_stop():
                 LOG_BUS.emit("WARNING", bot_id, "Oturum durduruldu")
                 return False
             if not found:
-                if job.entry_mode == "direct":
-                    LOG_BUS.emit("ERROR", bot_id, "Hedef urun acilamadi")
-                else:
-                    LOG_BUS.emit(
-                        "WARNING",
-                        bot_id,
-                        f'"{keyword}" — hedef -p-{pid} {job.max_pages} sayfada yok',
-                    )
+                self._excluded_keywords.add(keyword)
+                LOG_BUS.emit(
+                    "WARNING",
+                    bot_id,
+                    f'"{keyword}" — hedef -p-{pid} {job.max_pages} sayfada yok; tekrar aranmayacak',
+                )
                 return False
 
             await dismiss_overlays(page, bot_id)
-
-            if job.modules.hit:
-                await view_product_page(page, bot_id, speed=1.0, scroll_bursts=4)
-            if job.modules.favorite:
-                await add_favorite(page, bot_id, speed=1.0)
-            if job.modules.cart:
-                await add_to_cart(page, bot_id, speed=1.0)
-            if job.modules.question:
-                ok = await ask_question_with_account(
-                    page,
-                    bot_id,
-                    job.modules.question_text,
-                    speed=1.0,
-                    email=email or "",
-                    password=password or "",
-                )
-                if not ok:
-                    LOG_BUS.emit("WARNING", bot_id, "Soru gonderilemedi")
-                    return False
+            await view_product_page(page, bot_id, speed=speed, scroll_bursts=scroll_bursts)
+            await page.wait_for_timeout(3000)
 
             LOG_BUS.emit("SUCCESS", bot_id, f"Hedef urune hit OK (-p-{pid})")
             return True
         finally:
             try:
-                await ctx.close()
-                await asyncio.sleep(0.2)
+                await asyncio.wait_for(ctx.close(), timeout=10.0)
+            except asyncio.TimeoutError:
+                LOG_BUS.emit("WARNING", bot_id, "Tarayici kapanma zaman asimi")
             except Exception:
                 pass
+            await asyncio.sleep(0.1)
             if job.guest_mode:
                 try:
                     p = Path(prof_path)
@@ -229,15 +238,15 @@ class HitEngine:
         job: HitJob,
         index: int,
         keywords: list[str],
-    ) -> tuple[str, str | None, str | None]:
-        if job.entry_mode == "direct":
-            acc = job.accounts[0]
-            return "direct", acc[0], acc[1]
+    ) -> tuple[str, str | None, str | None, str | None]:
         kw = self._keyword_for_session(job, keywords, index)
         if job.guest_mode:
-            return kw, None, None
+            return kw, None, None, None
         acc = job.accounts[index % len(job.accounts)]
-        return kw, acc[0], acc[1]
+        email = acc[0]
+        pwd = acc[1] if len(acc) >= 2 else ""
+        tok = acc[2] if len(acc) >= 3 else None
+        return kw, email, pwd, tok
 
     async def _run_wave(
         self,
@@ -257,8 +266,23 @@ class HitEngine:
             async with sem:
                 if should_stop():
                     return False
-                kw, email, pwd = self._session_credentials(job, idx, keywords)
-                ok = await self._run_one(pw, job, kw, idx, email, pwd)
+                kw, email, pwd, tok = self._session_credentials(job, idx, keywords)
+                bot_id = idx + 1
+                try:
+                    ok = await asyncio.wait_for(
+                        self._run_one(pw, job, kw, idx, email, pwd, tok),
+                        timeout=job.session_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    LOG_BUS.emit(
+                        "ERROR",
+                        bot_id,
+                        f'Oturum zaman asimi ({int(job.session_timeout)}sn) — "{kw}" atlandi',
+                    )
+                    ok = False
+                except Exception as exc:
+                    LOG_BUS.emit("ERROR", bot_id, f"Oturum hatasi: {exc}")
+                    ok = False
                 self._record_keyword_result(kw, ok)
                 if ok:
                     self.stats["ok"] += 1
@@ -314,14 +338,12 @@ class HitEngine:
             return self.stats
 
         keywords = [k.strip() for k in job.keywords if k.strip()]
-        if job.entry_mode == "organic" and not keywords:
+        if not keywords:
             LOG_BUS.emit("ERROR", 0, "Anahtar kelime bos")
             return self.stats
 
-        self._init_keyword_stats(keywords)
-
         target = parse_target(job.product_url, default_keyword=keywords[0] if keywords else "")
-        if job.entry_mode == "organic" and not target.product_id:
+        if not target.product_id:
             LOG_BUS.emit(
                 "ERROR",
                 0,
@@ -329,18 +351,8 @@ class HitEngine:
             )
             return self.stats
 
-        if job.entry_mode == "direct":
-            if job.guest_mode:
-                LOG_BUS.emit("ERROR", 0, "Direct mod icin hesap gerekli")
-                return self.stats
-            if not job.accounts:
-                LOG_BUS.emit("ERROR", 0, "Hesap listesi bos")
-                return self.stats
-            job.total_hits = max(1, job.total_hits or 1)
-            job.parallel = min(job.parallel, job.total_hits)
-
         parallel = max(1, min(job.parallel, 100))
-        unlimited = job.total_hits <= 0 and job.entry_mode == "organic"
+        unlimited = job.total_hits <= 0
 
         if unlimited:
             planned = "sonsuz (DURDUR)"
@@ -381,20 +393,40 @@ class HitEngine:
         session_index = 0
 
         async with async_playwright() as pw:
-            if job.entry_mode == "organic":
-                job.product_ids = await self._resolve_product_ids(pw, job.product_url)
-                if not job.product_ids and target.product_id:
-                    job.product_ids = [target.product_id]
-                if job.product_ids:
-                    preview = ", ".join(f"p-{x}" for x in job.product_ids)
-                    LOG_BUS.emit(
-                        "INFO",
-                        0,
-                        f"Hedef ID (sadece link): {preview}",
-                    )
+            job.product_ids = await self._resolve_product_ids(pw, job.product_url)
+            if not job.product_ids and target.product_id:
+                job.product_ids = [target.product_id]
+            if job.product_ids:
+                preview = ", ".join(f"p-{x}" for x in job.product_ids)
+                LOG_BUS.emit(
+                    "INFO",
+                    0,
+                    f"Hedef ID (sadece link): {preview}",
+                )
+
+            keywords = await self._filter_ranked_keywords(job, keywords)
+            if not keywords:
+                LOG_BUS.emit(
+                    "ERROR",
+                    0,
+                    "Hicbir kelimede urun siralamada bulunamadi — hit baslatilmadi",
+                )
+                return self.stats
+            skipped = self._excluded_keywords
+            if skipped:
+                LOG_BUS.emit(
+                    "INFO",
+                    0,
+                    f"Hit sadece {len(keywords)} kelime icin: {', '.join(f'\"{k}\"' for k in keywords)}",
+                )
+
+            self._init_keyword_stats(keywords)
 
             if unlimited:
                 while not should_stop():
+                    if not self._active_keywords(keywords):
+                        LOG_BUS.emit("WARNING", 0, "Tum kelimeler siralama disi — hit durduruldu")
+                        break
                     wave = parallel
                     self.stats["waves"] += 1
                     LOG_BUS.emit(
@@ -421,6 +453,9 @@ class HitEngine:
                 total = job.total_hits if job.total_hits > 0 else len(keywords)
                 self.stats["total"] = total
                 while completed < total and not should_stop():
+                    if not self._active_keywords(keywords):
+                        LOG_BUS.emit("WARNING", 0, "Tum kelimeler siralama disi — hit durduruldu")
+                        break
                     wave = min(parallel, total - completed)
                     self.stats["waves"] += 1
                     ok, fail = await self._run_wave(
@@ -431,7 +466,8 @@ class HitEngine:
                     LOG_BUS.emit(
                         "INFO",
                         0,
-                        f"Ilerleme: {completed}/{total} | OK {self.stats['ok']} FAIL {self.stats['fail']}",
+                        f"Dalga {self.stats['waves']} bitti · {completed}/{total} · "
+                        f"OK {self.stats['ok']} FAIL {self.stats['fail']}",
                     )
                     if should_stop():
                         break

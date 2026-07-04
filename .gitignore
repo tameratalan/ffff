@@ -6,6 +6,12 @@ __pycache__/
 .env
 hesaplar.txt
 captcha_key.txt
+capsolver_key.txt
+tempmail_key.txt
+used_actions.json
+debug_*.png
+test_*_login*.png
+design_screenshots/
 data/rank_latest.json
 _tmp_acc.txt
 .DS_Store

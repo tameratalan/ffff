@@ -77,19 +77,20 @@ async def goto_search_page(page: Page, bot_id: int, keyword: str, page_num: int 
 
 
 async def dismiss_overlays(page: Page, bot_id: int) -> None:
-    for sel in (
-        SELECTORS["cookie_accept"],
-        SELECTORS["app_banner_close"],
-        SELECTORS["popup_close"],
-    ):
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1500):
-                await btn.click()
-                LOG_BUS.emit("INFO", bot_id, "🚫 Popup/banner kapatıldı.")
-                await human_delay(bot_id, 0.5, 1.0, speed=1.0)
-        except Exception:
-            pass
+    for _ in range(2):
+        for sel in (
+            SELECTORS["cookie_accept"],
+            SELECTORS["app_banner_close"],
+            SELECTORS["popup_close"],
+        ):
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click(timeout=3000, force=True)
+                    LOG_BUS.emit("INFO", bot_id, "Popup/banner kapatildi.")
+                    await human_delay(bot_id, 0.3, 0.6, speed=2.0)
+            except Exception:
+                pass
 
 
 async def _is_product_404(page: Page) -> bool:
@@ -106,8 +107,10 @@ async def wait_for_product_page(page: Page, bot_id: int, timeout: float = 15_000
 
     checks = [
         SELECTORS["product_title"],
+        "[data-testid='favorite-toggle']",
         'button[data-testid="favorite-button"]',
         'button[data-testid="add-to-basket"]',
+        'button[data-testid="add-to-cart-button"]',
     ]
     start = time.monotonic()
     while time.monotonic() - start < timeout / 1000:
@@ -257,7 +260,7 @@ async def find_product_organically(
                 )
                 await smooth_scroll(page, bot_id, bursts=random.randint(1, 3), speed=speed)
                 await links.nth(i).click()
-                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_load_state("domcontentloaded", timeout=20_000)
                 await human_delay(bot_id, 2, 5, label="Ürün sayfası yüklendi", speed=speed)
                 opened = primary_product_id(page.url) or extract_product_id(page.url)
                 if opened and not href_matches_product(page.url, ids):

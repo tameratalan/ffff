@@ -31,14 +31,20 @@ SELECTORS = {
         "[data-testid='product-name'], [data-testid='product-title']"
     ),
     "product_price": ".prc-dsc, .prc-slg",
-    "add_to_cart": "button.add-to-basket, button[data-testid='add-to-basket']",
+    "add_to_cart": (
+        "button[data-testid='add-to-cart-button'], "
+        "button.add-to-basket, button[data-testid='add-to-basket'], "
+        "button.add-to-cart-button"
+    ),
     "favorite_btn": (
-        "button[data-testid='favorite-button'], "
+        "[data-testid='favorite-toggle']:not([aria-pressed='true']), "
+        "button[data-testid='favorite-button']:not([aria-pressed='true']), "
         ".favourite-btn:not(.active), "
         "i.icon-heart:not(.icon-heart-filled), "
         "[class*='favorite-button']:not([aria-pressed='true'])"
     ),
     "favorite_active": (
+        "[data-testid='favorite-toggle'][aria-pressed='true'], "
         "button[data-testid='favorite-button'][aria-pressed='true'], "
         ".favourite-btn.active, "
         "i.icon-heart-filled, "
@@ -55,7 +61,14 @@ SELECTORS = {
     "review_helpful": "button:has-text('Faydalı'), .helpful-button",
     # Mağaza
     "seller_link": "a[href*='magaza'], a.seller-name, .merchant-name a",
-    "seller_follow": "button:has-text('Takip Et'), .follow-seller-btn",
+    "seller_follow": (
+        "button[data-testid='follow'], "
+        "button:has-text('Takip Et'), "
+        "button:has-text('TAKİP ET'), "
+        "button:has-text('Takip'), "
+        ".follow-seller-btn, "
+        "[class*='follow']:has-text('Takip')"
+    ),
     # Koleksiyon / kupon
     "collection_btn": "button:has-text('Koleksiyona'), .collection-btn",
     "coupon_btn": "button:has-text('Kupon'), .coupon-collect",

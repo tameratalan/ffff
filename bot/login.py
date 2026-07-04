@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from playwright.async_api import Page
 
@@ -255,23 +256,38 @@ async def _wait_login_result(
     bot_id: int,
     *,
     speed: float,
-    allow_captcha: bool = True,
+    allow_captcha: bool = False,
+    fast_timeout_sec: float = 12.0,
 ) -> bool:
-    """Giris sonrasi captcha / SMS / yonlendirme bekle."""
-    captcha_handled = False
+    """Giris sonucu (basarili/hatali) icin HIZLI bekleme.
 
-    for tick in range(90):
+    Var olan bir hesapla normal (form) giriste Trendyol pratikte captcha
+    istemiyor — sadece supheli/yeni cihaz girislerinde nadiren SMS/captcha
+    cikabiliyor. Bu yuzden:
+    - Captcha bekleme/cozme mantigi VARSAYILAN OLARAK KAPALI
+      (allow_captcha=False) — "captcha gelebilir" diye bekleme YOK, login
+      sonucu (`is_logged_in` / hata mesaji) en hizli sekilde kontrol edilir.
+    - Polling araligi 2.0s -> 0.25s'e indirildi, gereksiz `human_delay`
+      cagrisi kaldirildi; toplam hizli-bekleme suresi `fast_timeout_sec`
+      (varsayilan 12 sn) ile sinirli.
+    - Gercek SMS/OTP dogrulama (captcha degil, hesap guvenligi — otomatik
+      cozulemez) icin ayri/daha uzun bir bekleme dali korunuyor; bu, "her
+      hesaba giris hizli olsun" talebini etkilemez cunku OTP zaten nadir
+      ve elle mudahale gerektiren bir durumdur.
+    """
+    captcha_handled = False
+    otp_warned = False
+    otp_extra_ticks = 0
+    OTP_MAX_EXTRA_TICKS = 60  # OTP gorulurse ekstra ~60 * 1.0s = 60 sn
+
+    deadline = time.monotonic() + fast_timeout_sec
+
+    while True:
         if should_stop():
             return False
 
         if await is_logged_in(page):
             return True
-
-        url = (page.url or "").lower()
-        if "/giris" not in url and "/login" not in url:
-            await human_delay(bot_id, 0.8, 1.2, speed=speed)
-            if await is_logged_in(page):
-                return True
 
         if allow_captcha and await captcha_visible(page):
             if not captcha_handled:
@@ -289,21 +305,30 @@ async def _wait_login_result(
             LOG_BUS.emit("ERROR", bot_id, f"Giris hatasi: {err[:120]}")
             return False
 
-        otp = page.locator(
-            "input[placeholder*='kod' i], input[name*='otp' i], input[autocomplete='one-time-code']"
-        )
+        otp_now = False
         try:
-            if await otp.first.is_visible(timeout=300):
-                if tick == 0:
-                    LOG_BUS.emit(
-                        "WARNING",
-                        bot_id,
-                        "SMS/dogrulama kodu — tarayicida elle girin (90 sn)",
-                    )
+            otp = page.locator(
+                "input[placeholder*='kod' i], input[name*='otp' i], input[autocomplete='one-time-code']"
+            )
+            otp_now = await otp.first.is_visible(timeout=200)
         except Exception:
             pass
 
-        await asyncio.sleep(2.0)
+        if otp_now:
+            if not otp_warned:
+                LOG_BUS.emit(
+                    "WARNING", bot_id, "SMS/dogrulama kodu — tarayicida elle girin (60 sn)",
+                )
+                otp_warned = True
+            if otp_extra_ticks >= OTP_MAX_EXTRA_TICKS:
+                break
+            otp_extra_ticks += 1
+            await asyncio.sleep(1.0)
+            continue
+
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.25)
 
     return await is_logged_in(page)
 
@@ -316,9 +341,19 @@ async def trendyol_login(
     *,
     speed: float = 1.0,
     force: bool = False,
-    allow_captcha: bool = True,
+    allow_captcha: bool = False,
 ) -> bool:
-    """Trendyol'a email/sifre ile giris (2 adimli: e-posta -> Devam Et -> sifre)."""
+    """Trendyol'a email/sifre ile giris (2 adimli: e-posta -> Devam Et -> sifre).
+
+    `allow_captcha=False` (varsayilan): LOGIN akisinda captcha bekleme/cozme
+    mantigi tamamen devre disi — var olan hesaplarla normal giriste Trendyol
+    pratikte captcha istemiyor, bu yuzden giris cok daha hizli sonuclanir.
+    Supheli/yeni cihaz gibi nadir durumlarda captcha cikarsa ve cozulmesi
+    isteniyorsa `allow_captcha=True` verilebilir (eski davranis). NOT: Bu
+    parametre SADECE giris icindir — hesap OLUSTURMA (signup) akisi
+    (`bot/signup.py`) captcha'yi kendi icinde ayri ve degismeden kullanmaya
+    devam eder.
+    """
     LOG_BUS.emit("INFO", bot_id, f"Giris deneniyor: {email[:3]}***")
 
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -366,9 +401,9 @@ async def trendyol_login(
     if not await _click_login_submit(page):
         await page.keyboard.press("Enter")
 
-    LOG_BUS.emit("INFO", bot_id, "Giris sonucu bekleniyor (captcha/SMS olabilir)...")
+    LOG_BUS.emit("INFO", bot_id, "Giris sonucu bekleniyor...")
     if not await _wait_login_result(page, bot_id, speed=speed, allow_captcha=allow_captcha):
-        if await captcha_visible(page):
+        if allow_captcha and await captcha_visible(page):
             LOG_BUS.emit("ERROR", bot_id, "reCAPTCHA cozulmedi — Chrome'da kutucugu isaretleyin")
         else:
             LOG_BUS.emit("ERROR", bot_id, "Giris basarisiz — e-posta/sifre veya SMS dogrulama")
@@ -385,6 +420,96 @@ async def trendyol_login(
     return False
 
 
+async def login_with_token(
+    page: Page,
+    token: str,
+    email: str = "",
+    bot_id: int = 0,
+    *,
+    speed: float = 1.0,
+    redirect_url: str = "",
+) -> bool:
+    """Trendyol'a JWT auth token'i ('token' cookie'si) enjekte ederek giris yapar.
+
+    Form tabanli girise (`trendyol_login`) gore avantajlari:
+    - ~10-15x daha hizli (form doldurma / "Devam Et" adimlari yok).
+    - Yanlis sifre / captcha riski yok (sifre hic kullanilmiyor).
+
+    Token, Trendyol'un normal giris sonrasi `.trendyol.com` domaininde
+    ayarladigi httpOnly `token` cookie'siyle ayni formattadir (ES256 imzali
+    JWT; `email`/`userId`/`iss=auth.trendyol.com` claim'leri icerir). Hesap
+    olusturma veya harici bir akistan elde edilmis boyle bir token varsa
+    burada kullanilabilir; token gecersiz/suresi dolmussa fonksiyon False
+    doner ve cagiran taraf normal form-login'e (`trendyol_login`) geri
+    dusebilir.
+    """
+    token = (token or "").strip()
+    if not token:
+        LOG_BUS.emit("ERROR", bot_id, "login_with_token: token bos")
+        return False
+
+    masked = f"{email[:3]}***" if email else "???"
+    LOG_BUS.emit("INFO", bot_id, f"Token ile giris deneniyor: {masked}")
+
+    try:
+        await page.context.add_cookies([
+            {
+                "name": "token",
+                "value": token,
+                "domain": ".trendyol.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ])
+    except Exception as exc:
+        LOG_BUS.emit("ERROR", bot_id, f"Token cookie eklenemedi: {exc}")
+        return False
+
+    try:
+        dest = (redirect_url or TRENDYOL_HOME).strip()
+        await page.goto(dest, wait_until="domcontentloaded", timeout=20_000 if redirect_url else 30_000)
+    except Exception as exc:
+        LOG_BUS.emit("ERROR", bot_id, f"Sayfa acilamadi: {exc}")
+        return False
+
+    await dismiss_overlays(page, bot_id)
+    if not redirect_url:
+        await human_delay(bot_id, 0.3, 0.7, speed=speed)
+
+    if await is_logged_in(page):
+        LOG_BUS.emit("SUCCESS", bot_id, "Token ile giris basarili")
+        return True
+
+    LOG_BUS.emit("WARNING", bot_id, "Token ile giris basarisiz — token gecersiz/suresi dolmus olabilir")
+    return False
+
+
+async def smart_login(
+    page: Page,
+    email: str,
+    password: str,
+    bot_id: int,
+    *,
+    token: str = "",
+    speed: float = 1.0,
+    force: bool = False,
+    allow_captcha: bool = False,
+) -> bool:
+    """Varsa once token ile (hizli/guvenilir), olmazsa/basarisiz olursa
+    normal email+sifre formuyla giris dener. Mevcut cagrilari degistirmez —
+    yeni, opsiyonel bir giris noktasidir."""
+    if token:
+        if await login_with_token(page, token, email, bot_id, speed=speed):
+            return True
+        LOG_BUS.emit("INFO", bot_id, "Token basarisiz — form-login'e dusuluyor")
+
+    return await trendyol_login(
+        page, email, password, bot_id, speed=speed, force=force, allow_captcha=allow_captcha,
+    )
+
+
 async def ensure_logged_in(
     page: Page,
     email: str,
@@ -392,7 +517,7 @@ async def ensure_logged_in(
     bot_id: int,
     *,
     speed: float = 1.0,
-    allow_captcha: bool = True,
+    allow_captcha: bool = False,
 ) -> bool:
     """Mevcut sayfada oturum yoksa giris yap."""
     if await is_logged_in(page):

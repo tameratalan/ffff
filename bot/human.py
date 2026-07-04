@@ -61,6 +61,18 @@ async def bezier_move(page: Page, x: float, y: float, *, steps: int = 25) -> Non
         await asyncio.sleep(random.uniform(0.005, 0.02))
 
 
+async def quick_click(page: Page, selector: str, bot_id: int, *, timeout: float = 3_000, force: bool = False) -> bool:
+    """Turbo mod — kisa timeout, bezier yok."""
+    loc = page.locator(selector).first
+    try:
+        await loc.scroll_into_view_if_needed(timeout=timeout)
+        await loc.wait_for(state="visible", timeout=timeout)
+        await loc.click(timeout=timeout, force=force)
+        return True
+    except Exception:
+        return False
+
+
 async def human_click(page: Page, selector: str, bot_id: int) -> bool:
     loc = page.locator(selector).first
     try:
